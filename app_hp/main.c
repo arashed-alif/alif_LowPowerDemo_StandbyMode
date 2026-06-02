@@ -13,6 +13,7 @@
 #include <sys_clocks.h>
 #include <drv_bkram.h>
 #include <drv_mhu.h>
+#include <soc_clk.h>
 #include <lptimer.h>
 #include <uart.h>
 #include <pm.h>
@@ -23,6 +24,7 @@ volatile uint32_t mhu_rx_value;
 volatile uint32_t ms_ticks;
 void SysTick_Handler (void) { ms_ticks++; }
 void delay_ms (uint32_t msec) { msec += ms_ticks; while(ms_ticks < msec) __WFI(); }
+static void uart_init();
 
 void MHU_RTSS_S_TX_IRQHandler()
 {
@@ -51,17 +53,33 @@ void MHU_RTSS_S_RX_IRQHandler()
 
 static void boot_from_por()
 {
-    printf("RTSS-HP first boot\r\n\n");
+    /* get status of clock tree */
+    CoreClockUpdate();
+    SystBusClkUpdate();
+
+    ms_ticks = 0;
+    SysTick_Config(SystemCoreClock/1000);
+    uart_init();
+
+    printf("RTSS-HP first boot (SystemCoreClock: %" PRIu32 ")\r\n\n", SystemCoreClock);
     delay_ms(100);
 }
 
 static void boot_from_standby()
 {
+    /* get status of clock tree */
+    CoreClockUpdate();
+    SystBusClkUpdate();
+
+    ms_ticks = 0;
+    SysTick_Config(SystemCoreClock/1000);
+    uart_init();
+
     uint32_t cycle_cnt;
     bk_ram_rd(&cycle_cnt, BKRAM_INDEX_HP_CYCLES);
     cycle_cnt++;
     bk_ram_wr(&cycle_cnt, BKRAM_INDEX_HP_CYCLES);
-    printf("RTSS-HP resume count: %" PRIu32 "\r\n", cycle_cnt);
+    printf("RTSS-HP resume count: %" PRIu32 " (SystemCoreClock: %" PRIu32 ")\r\n", cycle_cnt, SystemCoreClock);
 
     NVIC_EnableIRQ(41);
     NVIC_EnableIRQ(42);
@@ -83,12 +101,13 @@ static void execute_while1_rtsshp()
 
     /* while(1) */
     active_ms += ms_ticks;
-    while(ms_ticks < active_ms);
+    while(ms_ticks < active_ms) __NOP();
 
+    /* send a "task finished" message to the other core */
     MHU_SENDER_Set(RTSS_TX_MHU0_BASE, 0, MHU_VAL);
 }
 
-static bool PrintPendingIRQ()
+static bool GetPendingIRQ()
 {
     uint32_t wic_pending = 0;
     wic_pending |= NVIC->ISPR[0];
@@ -97,15 +116,7 @@ static bool PrintPendingIRQ()
     /* nothing to do if IRQs 0-63 are clear */
     if (wic_pending == 0) return false;
 
-    /* Note: IRQ lines are shared in this multicore system,
-     * you will see pending IRQs not meant for this core. */
-    for (uint32_t i = 0; i < 64; i++) {
-        if (NVIC_GetPendingIRQ(i)) {
-            printf("IRQ%u is pending\r\n", i);
-        }
-    }
-
-    /* For example: only MHU0 RX should wake the HP core */
+    /* only MHU0 RX should wake the HP core */
     if (NVIC_GetPendingIRQ(41)) {
         return true;
     }
@@ -135,15 +146,7 @@ static void uart_update()
 
 int main (void)
 {
-    ms_ticks = 0;
-    SystemCoreClock = 76800000;
-    SystemAXIClock = 76800000;
-    SystemAHBClock = SystemAXIClock >> 1;
-    SystemAPBClock = SystemAXIClock >> 2;
-    SysTick_Config(SystemCoreClock/1000);
-    uart_init();
-
-    bool wake_event = PrintPendingIRQ();
+    bool wake_event = GetPendingIRQ();
     if (wake_event) {
         boot_from_standby();
         execute_while1_rtsshp();

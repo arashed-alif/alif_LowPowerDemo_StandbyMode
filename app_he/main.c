@@ -13,6 +13,8 @@
 #include <sys_clocks.h>
 #include <drv_bkram.h>
 #include <drv_mhu.h>
+#include <drv_pll.h>
+#include <soc_clk.h>
 #include <lptimer.h>
 #include <uart.h>
 #include <pm.h>
@@ -27,6 +29,7 @@ volatile uint32_t ms_ticks;
 void SysTick_Handler (void) { ms_ticks++; }
 void delay_ms (uint32_t msec) { msec += ms_ticks; while(ms_ticks < msec) __WFI(); }
 extern int32_t get_int_input();
+static void uart_init();
 
 void LPTIMER0_IRQHandler()
 {
@@ -79,6 +82,7 @@ void MHU_RTSS_S_RX_IRQHandler()
 
 static void reset_hp()
 {
+    *(volatile uint32_t*)0x1A604000 = 0U;
     *(volatile uint32_t*)0x1A010310 = 3U;
     while(*(volatile uint32_t*)0x1A010314 != 4);
     *(volatile uint32_t*)0x1A010310 = 1U;
@@ -86,7 +90,15 @@ static void reset_hp()
 
 static void boot_from_por()
 {
-    printf("RTSS-HE first boot\r\n\n");
+    /* get status of clock tree */
+    CoreClockUpdate();
+    SystBusClkUpdate();
+
+    ms_ticks = 0;
+    SysTick_Config(SystemCoreClock/1000);
+    uart_init();
+
+    printf("RTSS-HE first boot (SystemCoreClock: %" PRIu32 ")\r\n\n", SystemCoreClock);
     delay_ms(100);
 
     printf("Wake up period in milliseconds (e.g. 10ms to 10000ms)\r\n");
@@ -126,6 +138,10 @@ static void boot_from_por()
     if (ret || response) while(1);
     delay_ms(10);
 
+    PLL_uninitialize();
+    OSC_uninitialize();
+    OSC_initialize();
+
     /* turn off DEBUG and SYSTOP */
     *(volatile uint32_t*)0x1A010400 = 0;
 
@@ -152,11 +168,19 @@ static void boot_from_por()
 
 static void boot_from_standby()
 {
+    /* get status of clock tree */
+    CoreClockUpdate();
+    SystBusClkUpdate();
+
+    ms_ticks = 0;
+    SysTick_Config(SystemCoreClock/1000);
+    uart_init();
+
     uint32_t cycle_cnt;
     bk_ram_rd(&cycle_cnt, BKRAM_INDEX_HE_CYCLES);
     cycle_cnt++;
     bk_ram_wr(&cycle_cnt, BKRAM_INDEX_HE_CYCLES);
-    printf("RTSS-HE resume count: %" PRIu32 "\r\n", cycle_cnt);
+    printf("RTSS-HE resume count: %" PRIu32 " (SystemCoreClock: %" PRIu32 ")\r\n", cycle_cnt, SystemCoreClock);
 
     NVIC_EnableIRQ(41);
     NVIC_EnableIRQ(42);
@@ -189,7 +213,7 @@ static void execute_while1()
 
     /* while(1) */
     active_ms += ms_ticks;
-    while(ms_ticks < active_ms);
+    while(ms_ticks < active_ms) __NOP();
 }
 
 #ifndef M55_HE_E1C
@@ -202,11 +226,26 @@ static void execute_while1_rtsshp()
     if (cycle_cnt % 10) return;
     printf("RTSS-HE sending message to HP\r\n");
 
+#if !defined(ENSEMBLE_SOC_E1C)
     /* put DCDC in PWM mode for stability at high load */
     ANA->DCDC_REG2 &= ~(1U << 23);
+#endif
 
     /* turn on SYSTOP for use by the HP core */
     *(volatile uint32_t*)0x1A010400 |= (1U << 5);
+
+    /* start PLL for use by the AXI bus and HP core */
+    PLL_initialize(38400000U);
+
+    /* adjust dividers based on faster clocks */
+#if defined(ENSEMBLE_SOC_GEN2) || defined(ENSEMBLE_SOC_E1C)
+    BusClockConfig(2U, 3U, 2U, 2U); // ACLK = SYSPLL/4 and HCLK = PCLK = SYSPLL/4
+#else
+    BusClockConfig(2U, 3U, 0U, 0U); // ACLK = SYSPLL/4 and HCLK = PCLK = ACLK/1
+#endif
+
+    /* change clock muxes to PLL sources */
+    PllClockConfig((1U << 16)|(1U << 4));
 
     /* interrupt the HP core via MHU */
     MHU_SENDER_Set(RTSS_TX_MHU0_BASE, 0, MHU_VAL);
@@ -226,15 +265,26 @@ static void execute_while1_rtsshp()
         printf("RTSS-HE received message from HP\r\n\n");
     }
 
+    /* change clock muxes to non-PLL sources */
+    PllClockConfig(0U);
+
+    /* adjust dividers based on slower clocks */
+    BusClockConfig(2U, 0U, 1U, 2U);
+
+    /* stop PLL that is no longer being used by anyone */
+    PLL_uninitialize();
+
     /* turn off SYSTOP no longer used by the HP core */
     *(volatile uint32_t*)0x1A010400 &= ~(1U << 5);
 
+#if !defined(ENSEMBLE_SOC_E1C)
     /* put DCDC in PFM mode after SYSTOP and HP are off */
     ANA->DCDC_REG2 |= (1U << 23);
+#endif
 }
 #endif
 
-static bool PrintPendingIRQ()
+static bool GetPendingIRQ()
 {
     uint32_t wic_pending = 0;
     wic_pending |= NVIC->ISPR[0];
@@ -243,15 +293,7 @@ static bool PrintPendingIRQ()
     /* nothing to do if IRQs 0-63 are clear */
     if (wic_pending == 0) return false;
 
-    /* Note: IRQ lines are shared in this multicore system,
-     * you will see pending IRQs not meant for this core. */
-    for (uint32_t i = 0; i < 64; i++) {
-        if (NVIC_GetPendingIRQ(i)) {
-            printf("IRQ%u is pending\r\n", i);
-        }
-    }
-
-    /* For example: only LPTIMER should wake the HE core */
+    /* only LPTIMER should wake the HE core */
     if (NVIC_GetPendingIRQ(60 + LPT_CH)) {
         return true;
     }
@@ -279,15 +321,7 @@ static void uart_update()
 
 int main (void)
 {
-    ms_ticks = 0;
-    SystemCoreClock = 76800000;
-    SystemAXIClock = 76800000;
-    SystemAHBClock = SystemAXIClock >> 1;
-    SystemAPBClock = SystemAXIClock >> 2;
-    SysTick_Config(SystemCoreClock/1000);
-    uart_init();
-
-    bool wake_event = PrintPendingIRQ();
+    bool wake_event = GetPendingIRQ();
     if (wake_event) {
         boot_from_standby();
         execute_while1();

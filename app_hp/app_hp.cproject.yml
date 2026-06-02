@@ -9,6 +9,7 @@ project:
       files:
         - file: ../app_common/drv_bkram.c
         - file: ../app_common/drv_mhu.c
+        - file: ../app_common/soc_clk.c
 
   add-path:
     - ../app_common
